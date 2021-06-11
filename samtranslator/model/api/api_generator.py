@@ -55,6 +55,9 @@ UsagePlanProperties.__new__.__defaults__ = (None, None, None, None, None, None)
 
 GatewayResponseProperties = ["ResponseParameters", "ResponseTemplates", "StatusCode"]
 
+_GatewayDefault4XX5XXResponse = ["DEFAULT_4XX", "DEFAULT_5XX"]
+_GatewayDefault4XX5XXParameters = {"Headers": {"Access-Control-Allow-Origin": _CORS_WILDCARD}}
+
 
 class SharedApiUsagePlan(object):
     """
@@ -879,8 +882,9 @@ class ApiGenerator(object):
                 status_code=response.get("StatusCode", None),
             )
 
-        if gateway_responses:
-            swagger_editor.add_gateway_responses(gateway_responses)
+        self._set_default_4xx_5xx_responses(gateway_responses)
+
+        swagger_editor.add_gateway_responses(gateway_responses)
 
         # Assign the Swagger back to template
         self.definition_body = swagger_editor.swagger
@@ -1101,3 +1105,12 @@ class ApiGenerator(object):
         else:
             rest_api.EndpointConfiguration = {"Types": [value]}
             rest_api.Parameters = {"endpointConfigurationTypes": value}
+
+    def _set_default_4xx_5xx_responses(self, gateway_responses):
+        for default_response in _GatewayDefault4XX5XXResponse:
+            gateway_responses[default_response] = ApiGatewayResponse(
+                api_logical_id=self.logical_id,
+                response_parameters=_GatewayDefault4XX5XXParameters,
+                response_templates={},
+                status_code=None,
+            )
