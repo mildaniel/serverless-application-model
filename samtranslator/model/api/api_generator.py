@@ -887,9 +887,8 @@ class ApiGenerator(object):
                 status_code=response.get("StatusCode", None),
             )
 
-        self._set_default_4xx_5xx_responses(gateway_responses)
-
-        swagger_editor.add_gateway_responses(gateway_responses)
+        if gateway_responses:
+            swagger_editor.add_gateway_responses(gateway_responses)
 
         # Assign the Swagger back to template
         self.definition_body = swagger_editor.swagger
