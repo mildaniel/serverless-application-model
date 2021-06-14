@@ -130,18 +130,6 @@
               },
               "responseTemplates": {},
               "statusCode": "401"
-            },
-            "DEFAULT_4XX": {
-              "responseParameters": {
-                "gatewayresponse.header.Access-Control-Allow-Origin": "'*'"
-              },
-              "responseTemplates": {}
-            },
-            "DEFAULT_5XX": {
-              "responseParameters": {
-                "gatewayresponse.header.Access-Control-Allow-Origin": "'*'"
-              },
-              "responseTemplates": {}
             }
           }
         },
