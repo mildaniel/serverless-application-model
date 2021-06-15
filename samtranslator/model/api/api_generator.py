@@ -56,7 +56,6 @@ UsagePlanProperties.__new__.__defaults__ = (None, None, None, None, None, None)
 GatewayResponseProperties = ["ResponseParameters", "ResponseTemplates", "StatusCode"]
 
 _GatewayDefault4XX5XXResponse = ["DEFAULT_4XX", "DEFAULT_5XX"]
-_GatewayDefault4XX5XXParameters = {"Headers": {"Access-Control-Allow-Origin": _CORS_WILDCARD}}
 
 
 class SharedApiUsagePlan(object):
@@ -608,9 +607,7 @@ class ApiGenerator(object):
             )
 
         # Set default 4XX and 5XX responses if cors is enabled
-        gateway_responses = {}
-        self._set_default_4xx_5xx_responses(gateway_responses)
-        editor.add_gateway_responses(gateway_responses)
+        self._set_default_4xx_5xx_responses()
 
         # Assign the Swagger back to template
         self.definition_body = editor.swagger
@@ -1110,11 +1107,31 @@ class ApiGenerator(object):
             rest_api.EndpointConfiguration = {"Types": [value]}
             rest_api.Parameters = {"endpointConfigurationTypes": value}
 
-    def _set_default_4xx_5xx_responses(self, gateway_responses):
+    def _set_default_4xx_5xx_responses(self):
+        gateway_response_param = self._get_allowed_origin_parameters()
+        if not gateway_response_param:
+            return
+
+        # Ensure template doesn't already have custom configured 4xx and 5xx responses
+        custom_responses = []
+        if self.gateway_responses is not None:
+            custom_responses = self.gateway_responses
+        else:
+            self.gateway_responses = {}
+
         for default_response in _GatewayDefault4XX5XXResponse:
-            gateway_responses[default_response] = ApiGatewayResponse(
-                api_logical_id=self.logical_id,
-                response_parameters=_GatewayDefault4XX5XXParameters,
-                response_templates={},
-                status_code=None,
-            )
+            if default_response not in custom_responses:
+                self.gateway_responses[default_response] = {}
+                self.gateway_responses[default_response]["ResponseParameters"] = gateway_response_param
+
+    def _get_allowed_origin_parameters(self):
+        HEADER_VAL = "Headers"
+        ACCESS_CONTROL_VAL = "Access-Control-Allow-Origin"
+
+        if isinstance(self.cors, string_types) or is_intrinsic(self.cors):
+            return {HEADER_VAL: {ACCESS_CONTROL_VAL: self.cors}}
+        elif isinstance(self.cors, dict):
+            return {HEADER_VAL: {ACCESS_CONTROL_VAL: self.cors.get("AllowOrigin")}}
+        else:
+            # No specified origin, can't set default values.
+            return None
