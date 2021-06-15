@@ -1112,15 +1112,12 @@ class ApiGenerator(object):
         if not gateway_response_param:
             return
 
-        # Ensure template doesn't already have custom configured 4xx and 5xx responses
-        custom_responses = []
-        if self.gateway_responses is not None:
-            custom_responses = self.gateway_responses
-        else:
+        if self.gateway_responses is None:
             self.gateway_responses = {}
 
         for default_response in _GatewayDefault4XX5XXResponse:
-            if default_response not in custom_responses:
+            # Ensure template doesn't already have custom configured 4xx and 5xx responses
+            if default_response not in self.gateway_responses:
                 self.gateway_responses[default_response] = {}
                 self.gateway_responses[default_response]["ResponseParameters"] = gateway_response_param
 
