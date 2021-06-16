@@ -56,6 +56,8 @@ UsagePlanProperties.__new__.__defaults__ = (None, None, None, None, None, None)
 GatewayResponseProperties = ["ResponseParameters", "ResponseTemplates", "StatusCode"]
 
 _GatewayDefault4XX5XXResponse = ["DEFAULT_4XX", "DEFAULT_5XX"]
+_HEADER_VAL = "Headers"
+_ACCESS_CONTROL_VAL = "Access-Control-Allow-Origin"
 
 
 class SharedApiUsagePlan(object):
@@ -569,6 +571,8 @@ class ApiGenerator(object):
         if isinstance(self.cors, string_types) or is_intrinsic(self.cors):
             # Just set Origin property. Others will be defaults
             properties = CorsProperties(AllowOrigin=self.cors)
+
+            default_gw_response_param = {_HEADER_VAL: {_ACCESS_CONTROL_VAL: self.cors}}
         elif isinstance(self.cors, dict):
 
             # Make sure keys in the dict are recognized
@@ -576,6 +580,8 @@ class ApiGenerator(object):
                 raise InvalidResourceException(self.logical_id, INVALID_ERROR)
 
             properties = CorsProperties(**self.cors)
+
+            default_gw_response_param = {_HEADER_VAL: {_ACCESS_CONTROL_VAL: self.cors.get("AllowOrigin")}}
 
         else:
             raise InvalidResourceException(self.logical_id, INVALID_ERROR)
@@ -607,7 +613,7 @@ class ApiGenerator(object):
             )
 
         # Set default 4XX and 5XX responses if cors is enabled
-        self._set_default_4xx_5xx_responses()
+        self._set_default_4xx_5xx_responses(default_gw_response_param)
 
         # Assign the Swagger back to template
         self.definition_body = editor.swagger
@@ -1107,11 +1113,7 @@ class ApiGenerator(object):
             rest_api.EndpointConfiguration = {"Types": [value]}
             rest_api.Parameters = {"endpointConfigurationTypes": value}
 
-    def _set_default_4xx_5xx_responses(self):
-        gateway_response_param = self._get_allowed_origin_parameters()
-        if not gateway_response_param:
-            return
-
+    def _set_default_4xx_5xx_responses(self, default_gw_response_param):
         if self.gateway_responses is None:
             self.gateway_responses = {}
 
@@ -1119,16 +1121,4 @@ class ApiGenerator(object):
             # Ensure template doesn't already have custom configured 4xx and 5xx responses
             if default_response not in self.gateway_responses:
                 self.gateway_responses[default_response] = {}
-                self.gateway_responses[default_response]["ResponseParameters"] = gateway_response_param
-
-    def _get_allowed_origin_parameters(self):
-        HEADER_VAL = "Headers"
-        ACCESS_CONTROL_VAL = "Access-Control-Allow-Origin"
-
-        if isinstance(self.cors, string_types) or is_intrinsic(self.cors):
-            return {HEADER_VAL: {ACCESS_CONTROL_VAL: self.cors}}
-        elif isinstance(self.cors, dict):
-            return {HEADER_VAL: {ACCESS_CONTROL_VAL: self.cors.get("AllowOrigin")}}
-        else:
-            # No specified origin, can't set default values.
-            return None
+                self.gateway_responses[default_response]["ResponseParameters"] = default_gw_response_param
