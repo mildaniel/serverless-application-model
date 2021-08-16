@@ -138,7 +138,122 @@ def mock_sar_service_call(self, service_call_function, logical_id, *args):
 # api and s3 location for explicit api.
 
 
-class TestTranslatorEndToEnd(TestCase):
+class AbstractTestTranslator(TestCase):
+    def _read_input(self, testcase):
+        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml"), "r"))
+        # To uncover unicode-related bugs, convert dict to JSON string and parse JSON back to dict
+        return json.loads(json.dumps(manifest))
+
+    def _read_expected_output(self, testcase, partition):
+        partition_folder = partition if partition != "aws" else ""
+        expected_filepath = os.path.join(OUTPUT_FOLDER, partition_folder, testcase + ".json")
+        return json.load(open(expected_filepath, "r"))
+
+    def _compare_transform(self, manifest, expected, partition, region):
+        with patch("boto3.session.Session.region_name", region):
+            parameter_values = get_template_parameter_values()
+            mock_policy_loader = MagicMock()
+            mock_policy_loader.load.return_value = {
+                "AWSLambdaBasicExecutionRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole".format(
+                    partition
+                ),
+                "AmazonDynamoDBFullAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBFullAccess".format(partition),
+                "AmazonDynamoDBReadOnlyAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess".format(partition),
+                "AWSLambdaRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaRole".format(partition),
+            }
+            if partition == "aws":
+                mock_policy_loader.load.return_value[
+                    "AWSXrayWriteOnlyAccess"
+                ] = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+            else:
+                mock_policy_loader.load.return_value[
+                    "AWSXRayDaemonWriteAccess"
+                ] = "arn:{}:iam::aws:policy/AWSXRayDaemonWriteAccess".format(partition)
+
+            output_fragment = transform(manifest, parameter_values, mock_policy_loader)
+
+        print(json.dumps(output_fragment, indent=2))
+
+        # Only update the deployment Logical Id hash in Py3.
+        if sys.version_info.major >= 3:
+            self._update_logical_id_hash(expected)
+            self._update_logical_id_hash(output_fragment)
+
+        self.assertEqual(deep_sort_lists(output_fragment), deep_sort_lists(expected))
+
+    def _update_logical_id_hash(self, resources):
+        """
+        Brute force method for updating all APIGW Deployment LogicalIds and references to a consistent hash
+        """
+        output_resources = resources.get("Resources", {})
+        deployment_logical_id_dict = {}
+        rest_api_to_swagger_hash = {}
+        dict_of_things_to_delete = {}
+
+        # Find all RestApis in the template
+        for logical_id, resource_dict in output_resources.items():
+            if "AWS::ApiGateway::RestApi" == resource_dict.get("Type"):
+                resource_properties = resource_dict.get("Properties", {})
+                if "Body" in resource_properties:
+                    self._generate_new_deployment_hash(
+                        logical_id, resource_properties.get("Body"), rest_api_to_swagger_hash
+                    )
+
+                elif "BodyS3Location" in resource_dict.get("Properties"):
+                    self._generate_new_deployment_hash(
+                        logical_id, resource_properties.get("BodyS3Location"), rest_api_to_swagger_hash
+                    )
+
+        # Collect all APIGW Deployments LogicalIds and generate the new ones
+        for logical_id, resource_dict in output_resources.items():
+            if "AWS::ApiGateway::Deployment" == resource_dict.get("Type"):
+                resource_properties = resource_dict.get("Properties", {})
+
+                rest_id = resource_properties.get("RestApiId").get("Ref")
+
+                data_hash = rest_api_to_swagger_hash.get(rest_id)
+
+                description = resource_properties.get("Description")[: -len(data_hash)]
+
+                resource_properties["Description"] = description + data_hash
+
+                new_logical_id = logical_id[:-10] + data_hash[:10]
+
+                deployment_logical_id_dict[logical_id] = new_logical_id
+                dict_of_things_to_delete[logical_id] = (new_logical_id, resource_dict)
+
+        # Update References to APIGW Deployments
+        for logical_id, resource_dict in output_resources.items():
+            if "AWS::ApiGateway::Stage" == resource_dict.get("Type"):
+                resource_properties = resource_dict.get("Properties", {})
+
+                rest_id = resource_properties.get("RestApiId", {}).get("Ref", "")
+
+                data_hash = rest_api_to_swagger_hash.get(rest_id)
+
+                deployment_id = resource_properties.get("DeploymentId", {}).get("Ref")
+                new_logical_id = deployment_logical_id_dict.get(deployment_id, "")[:-10]
+                new_logical_id = new_logical_id + data_hash[:10]
+
+                resource_properties.get("DeploymentId", {})["Ref"] = new_logical_id
+
+        # To avoid mutating the template while iterating, delete only after find everything to update
+        for logical_id_to_remove, tuple_to_add in dict_of_things_to_delete.items():
+            output_resources[tuple_to_add[0]] = tuple_to_add[1]
+            del output_resources[logical_id_to_remove]
+
+        # Update any Output References in the template
+        for output_key, output_value in resources.get("Outputs", {}).items():
+            if output_value.get("Value").get("Ref") in deployment_logical_id_dict:
+                output_value["Value"]["Ref"] = deployment_logical_id_dict[output_value.get("Value").get("Ref")]
+
+    def _generate_new_deployment_hash(self, logical_id, dict_to_hash, rest_api_to_swagger_hash):
+        data_bytes = json.dumps(dict_to_hash, separators=(",", ":"), sort_keys=True).encode("utf8")
+        data_hash = hashlib.sha1(data_bytes).hexdigest()
+        rest_api_to_swagger_hash[logical_id] = data_hash
+
+
+class TestTranslatorEndToEnd(AbstractTestTranslator):
     @parameterized.expand(
         itertools.product(
             [
@@ -162,6 +277,7 @@ class TestTranslatorEndToEnd(TestCase):
                 "sqs",
                 "function_with_amq",
                 "function_with_amq_kms",
+                "function_with_mq_virtual_host",
                 "simpletable",
                 "simpletable_with_sse",
                 "implicit_api",
@@ -178,6 +294,7 @@ class TestTranslatorEndToEnd(TestCase):
                 "api_with_default_aws_iam_auth_and_no_auth_route",
                 "api_with_method_aws_iam_auth",
                 "api_with_aws_iam_auth_overrides",
+                "api_with_swagger_authorizer_none",
                 "api_with_method_settings",
                 "api_with_binary_media_types",
                 "api_with_binary_media_types_definition_body",
@@ -204,6 +321,7 @@ class TestTranslatorEndToEnd(TestCase):
                 "api_with_xray_tracing",
                 "api_request_model",
                 "api_with_stage_tags",
+                "api_with_mode",
                 "s3",
                 "s3_create_remove",
                 "s3_existing_lambda_notification_configuration",
@@ -223,6 +341,7 @@ class TestTranslatorEndToEnd(TestCase):
                 "iot_rule",
                 "layers_with_intrinsics",
                 "layers_all_properties",
+                "layer_deletion_policy_precedence",
                 "function_managed_inline_policy",
                 "unsupported_resources",
                 "intrinsic_functions",
@@ -268,6 +387,7 @@ class TestTranslatorEndToEnd(TestCase):
                 "simple_table_with_extra_tags",
                 "explicit_api_with_invalid_events_config",
                 "no_implicit_api_with_serverless_rest_api_resource",
+                "implicit_api_deletion_policy_precedence",
                 "implicit_api_with_serverless_rest_api_resource",
                 "implicit_api_with_auth_and_conditions_max",
                 "implicit_api_with_many_conditions",
@@ -283,6 +403,8 @@ class TestTranslatorEndToEnd(TestCase):
                 "function_with_event_dest_basic",
                 "function_with_event_dest_conditional",
                 "api_with_usageplans",
+                "api_with_usageplans_shared_attributes_two",
+                "api_with_usageplans_shared_attributes_three",
                 "api_with_usageplans_intrinsics",
                 "state_machine_with_inline_definition",
                 "state_machine_with_tags",
@@ -315,6 +437,7 @@ class TestTranslatorEndToEnd(TestCase):
                 "state_machine_with_xray_role",
                 "function_with_file_system_config",
                 "state_machine_with_permissions_boundary",
+                "version_deletion_policy_precedence",
             ],
             [
                 ("aws", "ap-southeast-1"),
@@ -332,43 +455,10 @@ class TestTranslatorEndToEnd(TestCase):
         partition = partition_with_region[0]
         region = partition_with_region[1]
 
-        manifest = yaml_parse(open(os.path.join(INPUT_FOLDER, testcase + ".yaml"), "r"))
-        # To uncover unicode-related bugs, convert dict to JSON string and parse JSON back to dict
-        manifest = json.loads(json.dumps(manifest))
-        partition_folder = partition if partition != "aws" else ""
-        expected_filepath = os.path.join(OUTPUT_FOLDER, partition_folder, testcase + ".json")
-        expected = json.load(open(expected_filepath, "r"))
+        manifest = self._read_input(testcase)
+        expected = self._read_expected_output(testcase, partition)
 
-        with patch("boto3.session.Session.region_name", region):
-            parameter_values = get_template_parameter_values()
-            mock_policy_loader = MagicMock()
-            mock_policy_loader.load.return_value = {
-                "AWSLambdaBasicExecutionRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole".format(
-                    partition
-                ),
-                "AmazonDynamoDBFullAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBFullAccess".format(partition),
-                "AmazonDynamoDBReadOnlyAccess": "arn:{}:iam::aws:policy/AmazonDynamoDBReadOnlyAccess".format(partition),
-                "AWSLambdaRole": "arn:{}:iam::aws:policy/service-role/AWSLambdaRole".format(partition),
-            }
-            if partition == "aws":
-                mock_policy_loader.load.return_value[
-                    "AWSXrayWriteOnlyAccess"
-                ] = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
-            else:
-                mock_policy_loader.load.return_value[
-                    "AWSXRayDaemonWriteAccess"
-                ] = "arn:{}:iam::aws:policy/AWSXRayDaemonWriteAccess".format(partition)
-
-            output_fragment = transform(manifest, parameter_values, mock_policy_loader)
-
-        print(json.dumps(output_fragment, indent=2))
-
-        # Only update the deployment Logical Id hash in Py3.
-        if sys.version_info.major >= 3:
-            self._update_logical_id_hash(expected)
-            self._update_logical_id_hash(output_fragment)
-
-        assert deep_sort_lists(output_fragment) == deep_sort_lists(expected)
+        self._compare_transform(manifest, expected, partition, region)
 
     @parameterized.expand(
         itertools.product(
@@ -451,7 +541,7 @@ class TestTranslatorEndToEnd(TestCase):
             self._update_logical_id_hash(expected)
             self._update_logical_id_hash(output_fragment)
 
-        assert deep_sort_lists(output_fragment) == deep_sort_lists(expected)
+        self.assertEqual(deep_sort_lists(output_fragment), deep_sort_lists(expected))
 
     @parameterized.expand(
         itertools.product(
@@ -509,78 +599,51 @@ class TestTranslatorEndToEnd(TestCase):
         if sys.version_info.major >= 3:
             self._update_logical_id_hash(expected)
             self._update_logical_id_hash(output_fragment)
-        assert deep_sort_lists(output_fragment) == deep_sort_lists(expected)
 
-    def _update_logical_id_hash(self, resources):
+        self.assertEqual(deep_sort_lists(output_fragment), deep_sort_lists(expected))
+
+    @parameterized.expand(
+        itertools.product(
+            [
+                (
+                    "usage_plans",
+                    ("api_with_usageplans_shared_no_side_effect_1", "api_with_usageplans_shared_no_side_effect_2"),
+                ),
+            ],
+            [
+                ("aws", "ap-southeast-1"),
+                ("aws-cn", "cn-north-1"),
+                ("aws-us-gov", "us-gov-west-1"),
+            ],
+        )
+    )
+    @patch(
+        "samtranslator.plugins.application.serverless_app_plugin.ServerlessAppPlugin._sar_service_call",
+        mock_sar_service_call,
+    )
+    @patch("botocore.client.ClientEndpointBridge._check_default_region", mock_get_region)
+    def test_transform_success_no_side_effect(self, testcase, partition_with_region):
         """
-        Brute force method for updating all APIGW Deployment LogicalIds and references to a consistent hash
+        Tests that the transform does not leak/leave data in shared caches/lists between executions
+        Performs the transform of the templates in a row without reinitialization
+        Data from template X should not leak in template X+1
+
+        Parameters
+        ----------
+        testcase : Tuple
+            Test name (unused) and Templates
+        templates : List
+            List of templates to transform
         """
-        output_resources = resources.get("Resources", {})
-        deployment_logical_id_dict = {}
-        rest_api_to_swagger_hash = {}
-        dict_of_things_to_delete = {}
+        partition = partition_with_region[0]
+        region = partition_with_region[1]
 
-        # Find all RestApis in the template
-        for logical_id, resource_dict in output_resources.items():
-            if "AWS::ApiGateway::RestApi" == resource_dict.get("Type"):
-                resource_properties = resource_dict.get("Properties", {})
-                if "Body" in resource_properties:
-                    self._generate_new_deployment_hash(
-                        logical_id, resource_properties.get("Body"), rest_api_to_swagger_hash
-                    )
+        for template in testcase[1]:
+            print(template, partition, region)
+            manifest = self._read_input(template)
+            expected = self._read_expected_output(template, partition)
 
-                elif "BodyS3Location" in resource_dict.get("Properties"):
-                    self._generate_new_deployment_hash(
-                        logical_id, resource_properties.get("BodyS3Location"), rest_api_to_swagger_hash
-                    )
-
-        # Collect all APIGW Deployments LogicalIds and generate the new ones
-        for logical_id, resource_dict in output_resources.items():
-            if "AWS::ApiGateway::Deployment" == resource_dict.get("Type"):
-                resource_properties = resource_dict.get("Properties", {})
-
-                rest_id = resource_properties.get("RestApiId").get("Ref")
-
-                data_hash = rest_api_to_swagger_hash.get(rest_id)
-
-                description = resource_properties.get("Description")[: -len(data_hash)]
-
-                resource_properties["Description"] = description + data_hash
-
-                new_logical_id = logical_id[:-10] + data_hash[:10]
-
-                deployment_logical_id_dict[logical_id] = new_logical_id
-                dict_of_things_to_delete[logical_id] = (new_logical_id, resource_dict)
-
-        # Update References to APIGW Deployments
-        for logical_id, resource_dict in output_resources.items():
-            if "AWS::ApiGateway::Stage" == resource_dict.get("Type"):
-                resource_properties = resource_dict.get("Properties", {})
-
-                rest_id = resource_properties.get("RestApiId", {}).get("Ref", "")
-
-                data_hash = rest_api_to_swagger_hash.get(rest_id)
-
-                deployment_id = resource_properties.get("DeploymentId", {}).get("Ref")
-                new_logical_id = deployment_logical_id_dict.get(deployment_id, "")[:-10]
-                new_logical_id = new_logical_id + data_hash[:10]
-
-                resource_properties.get("DeploymentId", {})["Ref"] = new_logical_id
-
-        # To avoid mutating the template while iterating, delete only after find everything to update
-        for logical_id_to_remove, tuple_to_add in dict_of_things_to_delete.items():
-            output_resources[tuple_to_add[0]] = tuple_to_add[1]
-            del output_resources[logical_id_to_remove]
-
-        # Update any Output References in the template
-        for output_key, output_value in resources.get("Outputs", {}).items():
-            if output_value.get("Value").get("Ref") in deployment_logical_id_dict:
-                output_value["Value"]["Ref"] = deployment_logical_id_dict[output_value.get("Value").get("Ref")]
-
-    def _generate_new_deployment_hash(self, logical_id, dict_to_hash, rest_api_to_swagger_hash):
-        data_bytes = json.dumps(dict_to_hash, separators=(",", ":"), sort_keys=True).encode("utf8")
-        data_hash = hashlib.sha1(data_bytes).hexdigest()
-        rest_api_to_swagger_hash[logical_id] = data_hash
+            self._compare_transform(manifest, expected, partition, region)
 
 
 @pytest.mark.parametrize(
@@ -643,6 +706,11 @@ class TestTranslatorEndToEnd(TestCase):
         "error_function_with_cwe_missing_dlq_property",
         "error_invalid_logical_id",
         "error_layer_invalid_properties",
+        "error_missing_basic_auth_in_mq",
+        "error_missing_basic_auth_uri_in_mq",
+        "error_multiple_basic_auth_in_mq",
+        "error_missing_sac_in_mq",
+        "error_invalid_config_mq",
         "error_missing_broker",
         "error_missing_queue",
         "error_missing_startingposition",
